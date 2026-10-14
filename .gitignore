@@ -1,2 +1,3 @@
 /build/
 /.flowstate-local.mk
+__pycache__/

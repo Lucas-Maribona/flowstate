@@ -2,8 +2,16 @@
 #include <cstdlib>
 #include <csignal>
 #include <ctime>
+#include <algorithm>
+#include <charconv>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
+#include <vector>
+
+#include <linux/input-event-codes.h>
+
+#include "Layout.hpp"
 
 extern "C" {
 #include <wayland-server-core.h>
@@ -25,6 +33,7 @@ extern "C" {
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/util/edges.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 }
@@ -63,7 +72,8 @@ struct Output {
     wlr_output *output;
     wlr_scene_output *sceneOutput;
     bool valid = false;
-    Hook frame, requestState, destroy;
+    int width = 0, height = 0;
+    Hook frame, requestState, commit, destroy;
 
     Output(Server &server, wlr_output *output);
     ~Output();
@@ -75,6 +85,10 @@ struct Toplevel {
     wlr_scene_tree *tree;
     Hook commit, map, unmap, destroy, maximize, fullscreen;
     bool mapped = false;
+    unsigned id;
+    flowstate::Rect tile{};
+    bool hasTile = false;
+    flowstate::Rect geometry{};
 
     Toplevel(Server &server, wlr_xdg_toplevel *xdg);
     ~Toplevel();
@@ -84,6 +98,7 @@ struct Keyboard {
     Server &server;
     wlr_keyboard *keyboard;
     Hook key, modifiers, destroy;
+    std::unordered_set<uint32_t> interceptedKeys;
 
     Keyboard(Server &server, wlr_input_device *device);
     ~Keyboard();
@@ -100,8 +115,13 @@ struct Server {
     wlr_cursor *cursor = nullptr;
     wlr_xcursor_manager *cursorManager = nullptr;
     wlr_seat *seat = nullptr;
+    wlr_scene_rect *background = nullptr;
+    Output *activeOutput = nullptr;
+    Toplevel *focused = nullptr;
+    std::vector<Toplevel *> mapped;
+    unsigned nextWindowId = 1;
+    int gap = 12;
     bool outputFailed = false;
-    int mappedCount = 0;
     bool clientFrameSeen = false;
     Hook newOutput, newInput, newToplevel;
     Hook motion, motionAbsolute, button, axis, pointerFrame, requestCursor;
@@ -109,6 +129,10 @@ struct Server {
     ~Server();
     void start(const char *socket);
     void pointerMotion(uint32_t time);
+    void relayout();
+    void focus(Toplevel *window);
+    void cycleFocus(int direction);
+    Toplevel *windowAtCursor() const;
 };
 
 Output::Output(Server &server, wlr_output *output)
@@ -131,13 +155,16 @@ Output::Output(Server &server, wlr_output *output)
     auto *layoutOutput = wlr_output_layout_add_auto(server.layout, output);
     sceneOutput = wlr_scene_output_create(server.scene, output);
     wlr_scene_output_layout_add_output(server.sceneLayout, layoutOutput, sceneOutput);
+    server.activeOutput = this;
+    wlr_output_effective_resolution(output, &width, &height);
+    server.relayout();
 
     frame.add(&output->events.frame, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Output>(listener);
         const bool committed = wlr_scene_output_commit(self.sceneOutput, nullptr);
         if (!committed)
             std::fputs("Flowstate: Vulkan frame commit failed\n", stderr);
-        if (committed && self.server.mappedCount > 0 && !self.server.clientFrameSeen) {
+        if (committed && !self.server.mapped.empty() && !self.server.clientFrameSeen) {
             self.server.clientFrameSeen = true;
             std::fputs("Flowstate: Vulkan frame with client committed\n", stderr);
         }
@@ -150,8 +177,20 @@ Output::Output(Server &server, wlr_output *output)
         auto *event = static_cast<wlr_output_event_request_state *>(data);
         wlr_output_commit_state(self.output, event->state);
     });
+    commit.add(&output->events.commit, this, [](wl_listener *listener, void *) {
+        auto &self = Hook::from<Output>(listener);
+        int width, height;
+        wlr_output_effective_resolution(self.output, &width, &height);
+        if (width != self.width || height != self.height) {
+            self.width = width;
+            self.height = height;
+            self.server.relayout();
+            std::fprintf(stderr, "Flowstate: output resized %dx%d\n", width, height);
+        }
+    });
     destroy.add(&output->events.destroy, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Output>(listener);
+        self.server.activeOutput = nullptr;
         wl_display_terminate(self.server.display);
         delete &self;
     });
@@ -162,43 +201,73 @@ Output::~Output()
 {
     frame.remove();
     requestState.remove();
+    commit.remove();
     destroy.remove();
 }
 
 Toplevel::Toplevel(Server &server, wlr_xdg_toplevel *xdg)
-    : server(server), xdg(xdg), tree(wlr_scene_xdg_surface_create(&server.scene->tree, xdg->base))
+    : server(server), xdg(xdg), tree(wlr_scene_xdg_surface_create(&server.scene->tree, xdg->base)),
+      id(server.nextWindowId++)
 {
-    wlr_scene_node_set_position(&tree->node, 40, 40);
+    // The scene helper's origin is the xdg window geometry, including any
+    // client-side decoration offset. Tile coordinates can be used directly.
+    wlr_scene_node_set_enabled(&tree->node, false);
     commit.add(&xdg->base->surface->events.commit, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Toplevel>(listener);
-        if (self.xdg->base->initial_commit)
-            wlr_xdg_toplevel_set_size(self.xdg, 880, 520);
+        if (self.xdg->base->initial_commit && self.server.activeOutput) {
+            int width, height;
+            wlr_output_effective_resolution(self.server.activeOutput->output, &width, &height);
+            auto tiles = flowstate::tile(width, height, self.server.mapped.size() + 1,
+                                         self.server.gap);
+            const auto &rect = tiles.back();
+            wlr_xdg_toplevel_set_size(self.xdg, rect.width, rect.height);
+            wlr_xdg_toplevel_set_tiled(self.xdg, WLR_EDGE_TOP | WLR_EDGE_BOTTOM |
+                                                WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
+        }
+        if (self.mapped) {
+            const auto &box = self.xdg->base->geometry;
+            const flowstate::Rect actual{box.x, box.y, box.width, box.height};
+            if (actual != self.geometry) {
+                self.geometry = actual;
+                std::fprintf(stderr,
+                             "Flowstate: geometry id=%u offset=%d,%d width=%d height=%d\n",
+                             self.id, box.x, box.y, box.width, box.height);
+            }
+        }
     });
     map.add(&xdg->base->surface->events.map, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Toplevel>(listener);
         self.mapped = true;
-        ++self.server.mappedCount;
+        self.server.mapped.push_back(&self);
         self.server.clientFrameSeen = false;
-        wlr_xdg_toplevel_set_activated(self.xdg, true);
-        if (auto *keyboard = wlr_seat_get_keyboard(self.server.seat)) {
-            wlr_seat_keyboard_notify_enter(self.server.seat, self.xdg->base->surface,
-                                           keyboard->keycodes, keyboard->num_keycodes,
-                                           &keyboard->modifiers);
-        }
-        std::fputs("Flowstate: Wayland window mapped\n", stderr);
+        wlr_scene_node_set_enabled(&self.tree->node, true);
+        self.server.relayout();
+        self.server.focus(&self);
+        std::fprintf(stderr, "Flowstate: Wayland window mapped id=%u app=%s\n", self.id,
+                     self.xdg->app_id ? self.xdg->app_id : "unknown");
     });
     unmap.add(&xdg->base->surface->events.unmap, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Toplevel>(listener);
         self.mapped = false;
-        --self.server.mappedCount;
+        wlr_scene_node_set_enabled(&self.tree->node, false);
+        auto &windows = self.server.mapped;
+        windows.erase(std::remove(windows.begin(), windows.end(), &self), windows.end());
+        if (self.server.focused == &self)
+            self.server.focus(windows.empty() ? nullptr : windows.back());
+        self.server.relayout();
+        std::fprintf(stderr, "Flowstate: Wayland window unmapped id=%u\n", self.id);
     });
     maximize.add(&xdg->events.request_maximize, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Toplevel>(listener);
         wlr_xdg_toplevel_set_maximized(self.xdg, false);
+        if (self.xdg->base->initialized)
+            wlr_xdg_surface_schedule_configure(self.xdg->base);
     });
     fullscreen.add(&xdg->events.request_fullscreen, this, [](wl_listener *listener, void *) {
         auto &self = Hook::from<Toplevel>(listener);
         wlr_xdg_toplevel_set_fullscreen(self.xdg, false);
+        if (self.xdg->base->initialized)
+            wlr_xdg_surface_schedule_configure(self.xdg->base);
     });
     destroy.add(&xdg->events.destroy, this, [](wl_listener *listener, void *) {
         delete &Hook::from<Toplevel>(listener);
@@ -213,8 +282,13 @@ Toplevel::~Toplevel()
     maximize.remove();
     fullscreen.remove();
     destroy.remove();
-    if (mapped)
-        --server.mappedCount;
+    if (mapped) {
+        auto &windows = server.mapped;
+        windows.erase(std::remove(windows.begin(), windows.end(), this), windows.end());
+        if (server.focused == this)
+            server.focus(windows.empty() ? nullptr : windows.back());
+        server.relayout();
+    }
 }
 
 Keyboard::Keyboard(Server &server, wlr_input_device *device)
@@ -229,10 +303,44 @@ Keyboard::Keyboard(Server &server, wlr_input_device *device)
     wlr_seat_set_keyboard(server.seat, keyboard);
     wlr_seat_set_capabilities(server.seat,
                               WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    if (server.focused) {
+        wlr_seat_keyboard_notify_enter(server.seat, server.focused->xdg->base->surface,
+                                       keyboard->keycodes, keyboard->num_keycodes,
+                                       &keyboard->modifiers);
+    }
 
     key.add(&keyboard->events.key, this, [](wl_listener *listener, void *data) {
         auto &self = Hook::from<Keyboard>(listener);
         auto *event = static_cast<wlr_keyboard_key_event *>(data);
+        if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
+            self.interceptedKeys.erase(event->keycode))
+            return;
+        const auto modifiers = wlr_keyboard_get_modifiers(self.keyboard);
+        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+            (modifiers & WLR_MODIFIER_ALT)) {
+            const xkb_keysym_t *symbols = nullptr;
+            const int count = xkb_state_key_get_syms(self.keyboard->xkb_state,
+                                                       event->keycode + 8, &symbols);
+            for (int i = 0; i < count; ++i) {
+                if (symbols[i] == XKB_KEY_Tab || symbols[i] == XKB_KEY_ISO_Left_Tab) {
+                    self.server.cycleFocus((modifiers & WLR_MODIFIER_SHIFT) ? -1 : 1);
+                    self.interceptedKeys.insert(event->keycode);
+                    return;
+                }
+                if (modifiers & WLR_MODIFIER_CTRL) {
+                    if (symbols[i] == XKB_KEY_j || symbols[i] == XKB_KEY_J) {
+                        self.server.cycleFocus(1);
+                        self.interceptedKeys.insert(event->keycode);
+                        return;
+                    }
+                    if (symbols[i] == XKB_KEY_k || symbols[i] == XKB_KEY_K) {
+                        self.server.cycleFocus(-1);
+                        self.interceptedKeys.insert(event->keycode);
+                        return;
+                    }
+                }
+            }
+        }
         wlr_seat_set_keyboard(self.server.seat, self.keyboard);
         wlr_seat_keyboard_notify_key(self.server.seat, event->time_msec,
                                      event->keycode, event->state);
@@ -252,6 +360,77 @@ Keyboard::~Keyboard()
     key.remove();
     modifiers.remove();
     destroy.remove();
+}
+
+void Server::relayout()
+{
+    if (!activeOutput)
+        return;
+    const int width = activeOutput->width;
+    const int height = activeOutput->height;
+    if (background)
+        wlr_scene_rect_set_size(background, width, height);
+    const auto tiles = flowstate::tile(width, height, mapped.size(), gap);
+    for (std::size_t i = 0; i < mapped.size(); ++i) {
+        auto &window = *mapped[i];
+        const auto &rect = tiles[i];
+        if (window.hasTile && window.tile == rect)
+            continue;
+        window.tile = rect;
+        window.hasTile = true;
+        wlr_scene_node_set_position(&window.tree->node, rect.x, rect.y);
+        wlr_xdg_toplevel_set_size(window.xdg, rect.width, rect.height);
+        std::fprintf(stderr, "Flowstate: tile id=%u x=%d y=%d width=%d height=%d\n",
+                     window.id, rect.x, rect.y, rect.width, rect.height);
+    }
+}
+
+void Server::focus(Toplevel *window)
+{
+    if (window == focused)
+        return;
+    if (focused && focused->mapped)
+        wlr_xdg_toplevel_set_activated(focused->xdg, false);
+    focused = window;
+    if (!window) {
+        wlr_seat_keyboard_clear_focus(seat);
+        std::fputs("Flowstate: focus cleared\n", stderr);
+        return;
+    }
+    wlr_scene_node_raise_to_top(&window->tree->node);
+    wlr_xdg_toplevel_set_activated(window->xdg, true);
+    auto *keyboard = wlr_seat_get_keyboard(seat);
+    if (keyboard) {
+        wlr_seat_keyboard_notify_enter(seat, window->xdg->base->surface,
+                                       keyboard->keycodes, keyboard->num_keycodes,
+                                       &keyboard->modifiers);
+    }
+    std::fprintf(stderr, "Flowstate: focus id=%u keyboard=%d\n", window->id,
+                 seat->keyboard_state.focused_surface == window->xdg->base->surface);
+}
+
+void Server::cycleFocus(int direction)
+{
+    if (mapped.empty())
+        return;
+    auto it = std::find(mapped.begin(), mapped.end(), focused);
+    const auto index = it == mapped.end() ? 0 : static_cast<std::size_t>(it - mapped.begin());
+    const auto next = (index + mapped.size() + direction) % mapped.size();
+    focus(mapped[next]);
+}
+
+Toplevel *Server::windowAtCursor() const
+{
+    double sx = 0, sy = 0;
+    auto *node = wlr_scene_node_at(&scene->tree.node, cursor->x, cursor->y, &sx, &sy);
+    while (node && node != &scene->tree.node) {
+        for (auto *window : mapped) {
+            if (node == &window->tree->node)
+                return window;
+        }
+        node = node->parent ? &node->parent->node : nullptr;
+    }
+    return nullptr;
 }
 
 void Server::pointerMotion(uint32_t time)
@@ -282,6 +461,26 @@ void Server::start(const char *socket)
     };
     wl_event_loop_add_signal(eventLoop, SIGINT, terminate, display);
     wl_event_loop_add_signal(eventLoop, SIGTERM, terminate, display);
+    wl_event_loop_add_signal(eventLoop, SIGUSR1, [](int, void *data) {
+        auto &self = *static_cast<Server *>(data);
+        if (!self.activeOutput)
+            return 0;
+        auto *output = self.activeOutput;
+        const bool compact = output->width != 800 || output->height != 500;
+        wlr_output_state state;
+        wlr_output_state_init(&state);
+        wlr_output_state_set_custom_mode(&state, compact ? 800 : 960,
+                                          compact ? 500 : 600, 0);
+        const bool resized = wlr_output_commit_state(output->output, &state);
+        wlr_output_state_finish(&state);
+        if (!resized)
+            std::fputs("Flowstate: output resize failed\n", stderr);
+        return 0;
+    }, this);
+    wl_event_loop_add_signal(eventLoop, SIGUSR2, [](int, void *data) {
+        static_cast<Server *>(data)->cycleFocus(1);
+        return 0;
+    }, this);
     backend = wlr_wl_backend_create(eventLoop, nullptr);
     if (!backend)
         throw std::runtime_error("Could not connect nested backend to parent Wayland display");
@@ -303,7 +502,7 @@ void Server::start(const char *socket)
     scene = wlr_scene_create();
     sceneLayout = wlr_scene_attach_output_layout(scene, layout);
     const float background[4] = {0.025f, 0.04f, 0.07f, 1.0f};
-    wlr_scene_rect_create(&scene->tree, 960, 600, background);
+    this->background = wlr_scene_rect_create(&scene->tree, 1, 1, background);
     auto *shell = wlr_xdg_shell_create(display, 3);
     newToplevel.add(&shell->events.new_toplevel, this, [](wl_listener *listener, void *data) {
         new Toplevel(Hook::from<Server>(listener), static_cast<wlr_xdg_toplevel *>(data));
@@ -345,6 +544,8 @@ void Server::start(const char *socket)
     button.add(&cursor->events.button, this, [](wl_listener *listener, void *data) {
         auto &self = Hook::from<Server>(listener);
         auto *event = static_cast<wlr_pointer_button_event *>(data);
+        if (event->button == BTN_LEFT && event->state == WL_POINTER_BUTTON_STATE_PRESSED)
+            self.focus(self.windowAtCursor());
         wlr_seat_pointer_notify_button(self.seat, event->time_msec, event->button, event->state);
     });
     axis.add(&cursor->events.axis, this, [](wl_listener *listener, void *data) {
@@ -380,6 +581,8 @@ Server::~Server()
 {
     if (display)
         wl_display_destroy_clients(display);
+    if (activeOutput && activeOutput->sceneOutput)
+        wlr_scene_output_commit(activeOutput->sceneOutput, nullptr);
     newOutput.remove(); newInput.remove(); newToplevel.remove();
     motion.remove(); motionAbsolute.remove(); button.remove(); axis.remove();
     pointerFrame.remove(); requestCursor.remove();
@@ -409,6 +612,16 @@ int main(int argc, char **argv)
     wlr_log_init(WLR_INFO, nullptr);
     try {
         Server server;
+        if (argc > 2) {
+            if (argc != 4 || std::string(argv[2]) != "--gap")
+                throw std::runtime_error("Usage: flowstate-nested [socket] [--gap 0..128]");
+            const std::string value = argv[3];
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(),
+                                                      server.gap);
+            if (error != std::errc{} || end != value.data() + value.size() ||
+                server.gap < 0 || server.gap > 128)
+                throw std::runtime_error("Gap must be an integer from 0 to 128");
+        }
         server.start(socket.c_str());
     } catch (const std::exception &error) {
         std::fprintf(stderr, "Flowstate nested compositor: %s\n", error.what());

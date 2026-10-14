@@ -33,10 +33,14 @@ foreach(header IN ITEMS render/color.h types/wlr_scene.h)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/wlr-cxx/wlr/${header}" "${header_text}")
 endforeach()
 
+add_library(flowstate-layout src/Layout.cpp)
+target_include_directories(flowstate-layout PUBLIC src)
+
 add_executable(flowstate-nested src/Nested.cpp)
 target_compile_definitions(flowstate-nested PRIVATE WLR_USE_UNSTABLE)
 target_include_directories(flowstate-nested BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/wlr-cxx")
 target_link_libraries(flowstate-nested PRIVATE
+    flowstate-layout
     PkgConfig::WLROOTS
     PkgConfig::WAYLAND_SERVER
     PkgConfig::XKBCOMMON
@@ -45,6 +49,10 @@ target_link_libraries(flowstate-nested PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(layout-test tests/layout_test.cpp)
+    target_link_libraries(layout-test PRIVATE flowstate-layout)
+    add_test(NAME layout COMMAND layout-test)
+
     add_test(NAME vulkan-backend COMMAND flowstate --probe-vulkan)
     set_tests_properties(vulkan-backend PROPERTIES
         TIMEOUT 15
@@ -60,6 +68,18 @@ if(BUILD_TESTING)
     )
     set_tests_properties(nested-vulkan-client PROPERTIES
         TIMEOUT 20
+        LABELS "requires-wayland-vulkan"
+    )
+
+    find_program(FOOT_EXECUTABLE foot REQUIRED)
+    add_test(NAME three-wayland-windows
+        COMMAND Python3::Interpreter
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/three_windows.py
+            $<TARGET_FILE:flowstate-nested>
+            ${FOOT_EXECUTABLE}
+    )
+    set_tests_properties(three-wayland-windows PROPERTIES
+        TIMEOUT 35
         LABELS "requires-wayland-vulkan"
     )
 endif()
