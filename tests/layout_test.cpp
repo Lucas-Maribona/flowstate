@@ -1,45 +1,74 @@
 #include "Layout.hpp"
 
-#include <cstdio>
-#include <cstdlib>
+#include <QtTest/QTest>
+#include <algorithm>
 #include <vector>
 
 using flowstate::Rect;
 using flowstate::tile;
 
-static void check(bool condition)
-{
-    if (!condition) {
-        std::fputs("Layout assertion failed\n", stderr);
-        std::abort();
+class LayoutTest : public QObject {
+    Q_OBJECT
+
+private slots:
+    void standardLayouts()
+    {
+        QCOMPARE(tile(960, 600, 0, 12), std::vector<Rect>{});
+        QCOMPARE(tile(960, 600, 1, 12), (std::vector<Rect>{{12, 12, 936, 576}}));
+        QCOMPARE(tile(960, 600, 2, 12), (std::vector<Rect>{
+            {12, 12, 462, 576}, {486, 12, 462, 576}}));
+        QCOMPARE(tile(960, 600, 3, 12), (std::vector<Rect>{
+            {12, 12, 462, 576}, {486, 12, 462, 282}, {486, 306, 462, 282}}));
     }
-}
 
-int main()
-{
-    check(tile(960, 600, 0, 12).empty());
-    check((tile(960, 600, 1, 12) == std::vector<Rect>{{12, 12, 936, 576}}));
-    check((tile(960, 600, 2, 12) == std::vector<Rect>{
-        {12, 12, 462, 576}, {486, 12, 462, 576}}));
-    check((tile(960, 600, 3, 12) == std::vector<Rect>{
-        {12, 12, 462, 576}, {486, 12, 462, 282}, {486, 306, 462, 282}}));
+    void resizingAndGaps()
+    {
+        const auto odd = tile(961, 601, 3, 12);
+        QCOMPARE(odd[0].x, 12);
+        QCOMPARE(odd[0].width, 462);
+        QCOMPARE(odd[1].x, 486);
+        QCOMPARE(odd[1].width, 463);
+        QCOMPARE(odd[2].y + odd[2].height, 589);
+        QCOMPARE(tile(600, 400, 3, 12), (std::vector<Rect>{
+            {12, 12, 282, 376}, {306, 12, 282, 182}, {306, 206, 282, 182}}));
+        for (const auto &rect : tile(30, 20, 3, 128)) {
+            QVERIFY(rect.width > 0);
+            QVERIFY(rect.height > 0);
+        }
+    }
 
-    // Odd dimensions distribute the remainder without losing pixels.
-    const auto odd = tile(961, 601, 3, 12);
-    check(odd[0].x == 12 && odd[0].width == 462);
-    check(odd[1].x == 486 && odd[1].width == 463);
-    check(odd[2].y + odd[2].height == 589);
+    void smallOutput()
+    {
+        QCOMPARE(tile(1, 3, 3, 12), (std::vector<Rect>{
+            {0, 0, 1, 1}, {0, 1, 1, 1}, {0, 2, 1, 1}}));
+        QCOMPARE(tile(2, 2, 4, 12), (std::vector<Rect>{
+            {0, 0, 1, 1}, {1, 0, 1, 1}, {0, 1, 1, 1}, {1, 1, 1, 1}}));
+        QVERIFY(tile(1, 1, 4, 12).empty());
+        QVERIFY(tile(0, 10, 2, 12).empty());
+    }
 
-    const auto resized = tile(600, 400, 3, 12);
-    check(resized[0] == Rect(12, 12, 282, 376));
-    check(resized[1] == Rect(306, 12, 282, 182));
-    check(resized[2] == Rect(306, 206, 282, 182));
+    void manyWindowsNeverOverlap()
+    {
+        for (int width = 1; width <= 8; ++width) {
+            for (int height = 1; height <= 8; ++height) {
+                for (int count = 1; count <= std::min(width * height, 12); ++count) {
+                    const auto rectangles = tile(width, height, count, 12);
+                    QCOMPARE(rectangles.size(), static_cast<std::size_t>(count));
+                    for (std::size_t i = 0; i < rectangles.size(); ++i) {
+                        const auto &a = rectangles[i];
+                        QVERIFY(a.x >= 0 && a.y >= 0 && a.width > 0 && a.height > 0);
+                        QVERIFY(a.x + a.width <= width && a.y + a.height <= height);
+                        for (std::size_t j = 0; j < i; ++j) {
+                            const auto &b = rectangles[j];
+                            QVERIFY(a.x + a.width <= b.x || b.x + b.width <= a.x ||
+                                    a.y + a.height <= b.y || b.y + b.height <= a.y);
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
 
-    // A too-large gap is reduced; every normal-sized tile remains positive.
-    const auto small = tile(30, 20, 3, 128);
-    for (const auto &rect : small)
-        check(rect.width > 0 && rect.height > 0);
-
-    for (const auto &rect : tile(1, 1, 4, 12))
-        check(rect.width == 1 && rect.height == 1);
-}
+QTEST_GUILESS_MAIN(LayoutTest)
+#include "layout_test.moc"

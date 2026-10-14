@@ -50,9 +50,10 @@ def main():
 
             env = {**os.environ, "WAYLAND_DISPLAY": socket}
             for number in range(1, 4):
+                options = ["--maximized"] if number == 2 else []
                 clients.append(subprocess.Popen(
                     [sys.argv[2], "-o", "csd.preferred=client",
-                     "--app-id", f"flowstate-test-{number}",
+                     "--app-id", f"flowstate-test-{number}", *options,
                      "sh", "-c", "sleep 30"], env=env,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 ))
@@ -69,12 +70,28 @@ def main():
                 if match.group(1) == "0" and match.group(2) == "0":
                     raise RuntimeError("Foot did not exercise an xdg geometry offset")
             wait_for("focus id=3", log, server, clients)
+            wait_for("activation id=3 active=1", log, server, clients)
             wait_for("Vulkan frame with client committed", log, server, clients)
 
             log.seek(0)
             mark = len(log.read())
             server.send_signal(signal.SIGUSR2)
-            wait_for("focus id=1", log, server, clients, after=mark)
+            hover = wait_for(r"hover target id=(\d+)", log, server, clients,
+                             after=mark, regex=True)
+            hovered = int(hover.group(1))
+            wait_for(f"focus id={hovered} keyboard=1", log, server, clients, after=mark)
+            wait_for(f"activation id={hovered} active=1", log, server, clients, after=mark)
+            for _ in range(3):
+                log.seek(0)
+                mark = len(log.read())
+                server.send_signal(signal.SIGRTMIN)
+                cycle = wait_for(r"focus cycled from id=(\d+) to id=(\d+)",
+                                 log, server, clients, after=mark, regex=True)
+                source, target = map(int, cycle.groups())
+                if source not in (1, 2, 3) or target not in (1, 2, 3) or source == target:
+                    raise RuntimeError(f"Invalid focus cycle {source} -> {target}")
+                wait_for(f"focus id={target} keyboard=1", log, server, clients,
+                         after=mark)
             server.send_signal(signal.SIGUSR1)
             wait_for("output resized 800x500", log, server, clients)
             wait_for("tile id=1 x=12 y=12 width=382 height=476", log, server, clients)
@@ -85,13 +102,10 @@ def main():
                     rf"geometry id={number} offset=(-?\d+),(-?\d+) width={width} height={height}",
                     log, server, clients, regex=True)
 
-            log.seek(0)
-            mark = len(log.read())
             clients[0].terminate()
             clients[0].wait(timeout=5)
             clients.pop(0)
             wait_for("Wayland window unmapped id=1", log, server, clients)
-            wait_for("focus id=3", log, server, clients, after=mark)
             wait_for("tile id=2 x=12 y=12 width=382 height=476", log, server, clients)
 
             log.seek(0)
@@ -105,6 +119,19 @@ def main():
             for number in (2, 3):
                 wait_for(rf"geometry id={number} offset=(-?\d+),(-?\d+) width=462 height=576",
                          log, server, clients, after=mark, regex=True)
+
+            if "--stress" in sys.argv[3:]:
+                for iteration in range(8):
+                    log.seek(0)
+                    mark = len(log.read())
+                    server.send_signal(signal.SIGUSR1)
+                    expected = "800x500" if iteration % 2 == 0 else "960x600"
+                    wait_for(f"output resized {expected}", log, server, clients, after=mark)
+                    log.seek(0)
+                    mark = len(log.read())
+                    server.send_signal(signal.SIGRTMIN)
+                    wait_for(r"focus cycled from id=\d+ to id=\d+", log, server,
+                             clients, after=mark, regex=True)
         finally:
             for client in clients:
                 if client.poll() is None:
@@ -116,6 +143,7 @@ def main():
                     client.wait()
             if server.poll() is None:
                 try:
+                    wait_for("Wayland window unmapped id=2", log, server, [])
                     wait_for("Wayland window unmapped id=3", log, server, [])
                 except RuntimeError as error:
                     cleanup_error = error

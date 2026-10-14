@@ -57,8 +57,11 @@ def main() -> int:
         if socket_path.exists():
             raise RuntimeError("Nested compositor left its Wayland socket behind")
         log.seek(0)
-        if "allocations left" in log.read():
+        output = log.read()
+        if "allocations left" in output:
             raise RuntimeError("Vulkan allocations remained after shutdown")
+        if "Validation Error" in output:
+            raise RuntimeError(f"Vulkan validation reported an error:\n{output}")
     print("Nested Qt Wayland client mapped and a Vulkan frame was committed")
     return 0
 

@@ -4,6 +4,7 @@
 #include <ctime>
 #include <algorithm>
 #include <charconv>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -89,6 +90,7 @@ struct Toplevel {
     flowstate::Rect tile{};
     bool hasTile = false;
     flowstate::Rect geometry{};
+    std::optional<bool> acknowledgedActivation;
 
     Toplevel(Server &server, wlr_xdg_toplevel *xdg);
     ~Toplevel();
@@ -132,7 +134,8 @@ struct Server {
     void relayout();
     void focus(Toplevel *window);
     void cycleFocus(int direction);
-    Toplevel *windowAtCursor() const;
+    Toplevel *windowForNode(wlr_scene_node *node) const;
+    void hoverNext();
 };
 
 Output::Output(Server &server, wlr_output *output)
@@ -153,7 +156,11 @@ Output::Output(Server &server, wlr_output *output)
     wlr_wl_output_set_title(output, "Flowstate — nested Vulkan compositor");
     wlr_wl_output_set_app_id(output, "flowstate-nested");
     auto *layoutOutput = wlr_output_layout_add_auto(server.layout, output);
+    if (!layoutOutput)
+        return;
     sceneOutput = wlr_scene_output_create(server.scene, output);
+    if (!sceneOutput)
+        return;
     wlr_scene_output_layout_add_output(server.sceneLayout, layoutOutput, sceneOutput);
     server.activeOutput = this;
     wlr_output_effective_resolution(output, &width, &height);
@@ -219,12 +226,21 @@ Toplevel::Toplevel(Server &server, wlr_xdg_toplevel *xdg)
             wlr_output_effective_resolution(self.server.activeOutput->output, &width, &height);
             auto tiles = flowstate::tile(width, height, self.server.mapped.size() + 1,
                                          self.server.gap);
-            const auto &rect = tiles.back();
-            wlr_xdg_toplevel_set_size(self.xdg, rect.width, rect.height);
+            if (tiles.empty())
+                wlr_xdg_toplevel_set_size(self.xdg, 1, 1);
+            else
+                wlr_xdg_toplevel_set_size(self.xdg, tiles.back().width,
+                                           tiles.back().height);
             wlr_xdg_toplevel_set_tiled(self.xdg, WLR_EDGE_TOP | WLR_EDGE_BOTTOM |
                                                 WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
         }
         if (self.mapped) {
+            const bool active = self.xdg->current.activated;
+            if (self.acknowledgedActivation != active) {
+                self.acknowledgedActivation = active;
+                std::fprintf(stderr, "Flowstate: activation id=%u active=%d\n",
+                             self.id, active);
+            }
             const auto &box = self.xdg->base->geometry;
             const flowstate::Rect actual{box.x, box.y, box.width, box.height};
             if (actual != self.geometry) {
@@ -242,7 +258,8 @@ Toplevel::Toplevel(Server &server, wlr_xdg_toplevel *xdg)
         self.server.clientFrameSeen = false;
         wlr_scene_node_set_enabled(&self.tree->node, true);
         self.server.relayout();
-        self.server.focus(&self);
+        if (self.tree->node.enabled)
+            self.server.focus(&self);
         std::fprintf(stderr, "Flowstate: Wayland window mapped id=%u app=%s\n", self.id,
                      self.xdg->app_id ? self.xdg->app_id : "unknown");
     });
@@ -283,6 +300,7 @@ Toplevel::~Toplevel()
     fullscreen.remove();
     destroy.remove();
     if (mapped) {
+        mapped = false;
         auto &windows = server.mapped;
         windows.erase(std::remove(windows.begin(), windows.end(), this), windows.end());
         if (server.focused == this)
@@ -371,9 +389,17 @@ void Server::relayout()
     if (background)
         wlr_scene_rect_set_size(background, width, height);
     const auto tiles = flowstate::tile(width, height, mapped.size(), gap);
+    if (tiles.empty() && !mapped.empty()) {
+        for (auto *window : mapped)
+            wlr_scene_node_set_enabled(&window->tree->node, false);
+        focus(nullptr);
+        std::fputs("Flowstate: output too small to tile mapped windows\n", stderr);
+        return;
+    }
     for (std::size_t i = 0; i < mapped.size(); ++i) {
         auto &window = *mapped[i];
         const auto &rect = tiles[i];
+        wlr_scene_node_set_enabled(&window.tree->node, true);
         if (window.hasTile && window.tile == rect)
             continue;
         window.tile = rect;
@@ -383,10 +409,14 @@ void Server::relayout()
         std::fprintf(stderr, "Flowstate: tile id=%u x=%d y=%d width=%d height=%d\n",
                      window.id, rect.x, rect.y, rect.width, rect.height);
     }
+    if (!focused && !mapped.empty())
+        focus(mapped.back());
 }
 
 void Server::focus(Toplevel *window)
 {
+    if (window && (!window->mapped || !window->tree->node.enabled))
+        return;
     if (window == focused)
         return;
     if (focused && focused->mapped)
@@ -413,16 +443,17 @@ void Server::cycleFocus(int direction)
 {
     if (mapped.empty())
         return;
+    const unsigned previous = focused ? focused->id : 0;
     auto it = std::find(mapped.begin(), mapped.end(), focused);
     const auto index = it == mapped.end() ? 0 : static_cast<std::size_t>(it - mapped.begin());
     const auto next = (index + mapped.size() + direction) % mapped.size();
     focus(mapped[next]);
+    std::fprintf(stderr, "Flowstate: focus cycled from id=%u to id=%u\n",
+                 previous, mapped[next]->id);
 }
 
-Toplevel *Server::windowAtCursor() const
+Toplevel *Server::windowForNode(wlr_scene_node *node) const
 {
-    double sx = 0, sy = 0;
-    auto *node = wlr_scene_node_at(&scene->tree.node, cursor->x, cursor->y, &sx, &sy);
     while (node && node != &scene->tree.node) {
         for (auto *window : mapped) {
             if (node == &window->tree->node)
@@ -433,6 +464,23 @@ Toplevel *Server::windowAtCursor() const
     return nullptr;
 }
 
+void Server::hoverNext()
+{
+    if (mapped.empty())
+        return;
+    const auto it = std::find(mapped.begin(), mapped.end(), focused);
+    const auto index = it == mapped.end() ? 0 : static_cast<std::size_t>(it - mapped.begin());
+    auto *window = mapped[(index + 1) % mapped.size()];
+    if (!window->tree->node.enabled)
+        return;
+    const auto &rect = window->tile;
+    if (wlr_cursor_warp(cursor, nullptr, rect.x + rect.width / 2.0,
+                        rect.y + rect.height / 2.0)) {
+        pointerMotion(0);
+        std::fprintf(stderr, "Flowstate: hover target id=%u\n", window->id);
+    }
+}
+
 void Server::pointerMotion(uint32_t time)
 {
     double sx = 0, sy = 0;
@@ -441,6 +489,8 @@ void Server::pointerMotion(uint32_t time)
         ? wlr_scene_buffer_from_node(node) : nullptr;
     auto *surface = buffer ? wlr_scene_surface_try_from_buffer(buffer) : nullptr;
     if (surface) {
+        if (auto *window = windowForNode(node))
+            focus(window);
         wlr_seat_pointer_notify_enter(seat, surface->surface, sx, sy);
         wlr_seat_pointer_notify_motion(seat, time, sx, sy);
     } else {
@@ -478,7 +528,25 @@ void Server::start(const char *socket)
         return 0;
     }, this);
     wl_event_loop_add_signal(eventLoop, SIGUSR2, [](int, void *data) {
+        static_cast<Server *>(data)->hoverNext();
+        return 0;
+    }, this);
+    wl_event_loop_add_signal(eventLoop, SIGRTMIN, [](int, void *data) {
         static_cast<Server *>(data)->cycleFocus(1);
+        return 0;
+    }, this);
+    // A synthetic key through the normal seat path lets integration tests
+    // verify delivery to the currently focused client without a virtual input device.
+    wl_event_loop_add_signal(eventLoop, SIGRTMIN + 1, [](int, void *data) {
+        auto &self = *static_cast<Server *>(data);
+        if (self.focused && wlr_seat_get_keyboard(self.seat)) {
+            timespec now{};
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const uint32_t time = static_cast<uint32_t>(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+            wlr_seat_keyboard_notify_key(self.seat, time, KEY_A, WL_KEYBOARD_KEY_STATE_PRESSED);
+            wlr_seat_keyboard_notify_key(self.seat, time, KEY_A, WL_KEYBOARD_KEY_STATE_RELEASED);
+            std::fprintf(stderr, "Flowstate: synthetic test key sent to id=%u\n", self.focused->id);
+        }
         return 0;
     }, this);
     backend = wlr_wl_backend_create(eventLoop, nullptr);
@@ -544,8 +612,13 @@ void Server::start(const char *socket)
     button.add(&cursor->events.button, this, [](wl_listener *listener, void *data) {
         auto &self = Hook::from<Server>(listener);
         auto *event = static_cast<wlr_pointer_button_event *>(data);
-        if (event->button == BTN_LEFT && event->state == WL_POINTER_BUTTON_STATE_PRESSED)
-            self.focus(self.windowAtCursor());
+        if (event->button == BTN_LEFT && event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            double sx = 0, sy = 0;
+            auto *node = wlr_scene_node_at(&self.scene->tree.node,
+                                           self.cursor->x, self.cursor->y, &sx, &sy);
+            if (auto *window = self.windowForNode(node))
+                self.focus(window);
+        }
         wlr_seat_pointer_notify_button(self.seat, event->time_msec, event->button, event->state);
     });
     axis.add(&cursor->events.axis, this, [](wl_listener *listener, void *data) {
